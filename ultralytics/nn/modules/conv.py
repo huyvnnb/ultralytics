@@ -538,117 +538,79 @@ class RepConv(nn.Module):
             self.__delattr__("id_tensor")
 
 
+import torch.nn.functional as F
+
 class ChannelAttention(nn.Module):
     """
-    Channel-attention module for feature recalibration.
+    Module chú ý kênh (Channel Attention Module).
 
-    Applies attention weights to channels based on global average pooling.
-
-    Attributes:
-        pool (nn.AdaptiveAvgPool2d): Global average pooling.
-        fc (nn.Conv2d): Fully connected layer implemented as 1x1 convolution.
-        act (nn.Sigmoid): Sigmoid activation for attention weights.
-
-    References:
-        https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet
+    Tính toán sự quan trọng của từng kênh đặc trưng.
     """
+    def __init__(self, c1, r=16):  # c1: số kênh vào, r: tỉ lệ giảm
+        super(ChannelAttention, self).__init__()
+        # Sử dụng AdaptiveAvgPool2d và AdaptiveMaxPool2d để xử lý các kích thước feature map khác nhau
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-    def __init__(self, channels: int) -> None:
-        """
-        Initialize Channel-attention module.
+        # Mạng Perceptron đa lớp (MLP) dùng chung cho cả hai nhánh
+        self.shared_mlp = nn.Sequential(
+            nn.Conv2d(c1, c1 // r, 1, bias=False),  # Lớp ẩn, giảm số chiều
+            nn.ReLU(),
+            nn.Conv2d(c1 // r, c1, 1, bias=False)   # Lớp đầu ra, khôi phục số chiều
+        )
+        self.sigmoid = nn.Sigmoid()
 
-        Args:
-            channels (int): Number of input channels.
-        """
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Conv2d(channels, channels, 1, 1, 0, bias=True)
-        self.act = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply channel attention to input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            (torch.Tensor): Channel-attended output tensor.
-        """
-        return x * self.act(self.fc(self.pool(x)))
-
+    def forward(self, x):
+        avg_out = self.shared_mlp(self.avg_pool(x))
+        max_out = self.shared_mlp(self.max_pool(x))
+        # Cộng các đặc trưng từ hai nhánh và áp dụng Sigmoid
+        attention = self.sigmoid(avg_out + max_out)
+        return x * attention
 
 class SpatialAttention(nn.Module):
     """
-    Spatial-attention module for feature recalibration.
+    Module chú ý không gian (Spatial Attention Module).
 
-    Applies attention weights to spatial dimensions based on channel statistics.
-
-    Attributes:
-        cv1 (nn.Conv2d): Convolution layer for spatial attention.
-        act (nn.Sigmoid): Sigmoid activation for attention weights.
+    Tính toán sự quan trọng của từng vị trí trong không gian.
     """
-
-    def __init__(self, kernel_size=7):
-        """
-        Initialize Spatial-attention module.
-
-        Args:
-            kernel_size (int): Size of the convolutional kernel (3 or 7).
-        """
-        super().__init__()
-        assert kernel_size in {3, 7}, "kernel size must be 3 or 7"
-        padding = 3 if kernel_size == 7 else 1
-        self.cv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.act = nn.Sigmoid()
+    def __init__(self, k=7):  # k: kích thước kernel của lớp Conv
+        super(SpatialAttention, self).__init__()
+        # Lớp tích chập để tạo ra bản đồ chú ý không gian
+        # Padding được tính để giữ nguyên kích thước không gian của feature map
+        self.conv = nn.Conv2d(2, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        """
-        Apply spatial attention to input tensor.
+        # Áp dụng pooling theo chiều kênh (channel)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
 
-        Args:
-            x (torch.Tensor): Input tensor.
+        # Nối hai kết quả lại với nhau để tạo thành một tensor có 2 kênh
+        attention = torch.cat([avg_out, max_out], dim=1)
 
-        Returns:
-            (torch.Tensor): Spatial-attended output tensor.
-        """
-        return x * self.act(self.cv1(torch.cat([torch.mean(x, 1, keepdim=True), torch.max(x, 1, keepdim=True)[0]], 1)))
-
+        # Áp dụng tích chập và Sigmoid
+        attention = self.sigmoid(self.conv(attention))
+        return x * attention
 
 class CBAM(nn.Module):
     """
-    Convolutional Block Attention Module.
+    Khối Chú ý Tích chập (Convolutional Block Attention Module).
 
-    Combines channel and spatial attention mechanisms for comprehensive feature refinement.
-
-    Attributes:
-        channel_attention (ChannelAttention): Channel attention module.
-        spatial_attention (SpatialAttention): Spatial attention module.
+    Kết hợp Channel Attention và Spatial Attention một cách tuần tự.
+    Đây là module bạn sẽ gọi trong file .yaml.
     """
-
-    def __init__(self, c1, kernel_size=7):
-        """
-        Initialize CBAM with given parameters.
-
-        Args:
-            c1 (int): Number of input channels.
-            kernel_size (int): Size of the convolutional kernel for spatial attention.
-        """
-        super().__init__()
-        self.channel_attention = ChannelAttention(c1)
-        self.spatial_attention = SpatialAttention(kernel_size)
+    def __init__(self, c1, c2=None, r=16, k=7):
+        super(CBAM, self).__init__()
+        # Khởi tạo hai module con
+        self.channel_attention = ChannelAttention(c1, r)
+        self.spatial_attention = SpatialAttention(k)
 
     def forward(self, x):
-        """
-        Apply channel and spatial attention sequentially to input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            (torch.Tensor): Attended output tensor.
-        """
-        return self.spatial_attention(self.channel_attention(x))
+        # Áp dụng Channel Attention trước
+        x = self.channel_attention(x)
+        # Sau đó áp dụng Spatial Attention
+        x = self.spatial_attention(x)
+        return x
 
 
 class Concat(nn.Module):
